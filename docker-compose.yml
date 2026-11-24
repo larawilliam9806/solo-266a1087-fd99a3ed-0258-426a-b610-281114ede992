@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hourly-meter-reconciliation:latest
+    ports:
+      - "8000:8000"
+    expose:
+      - "8000"
+    environment:
+      DB_PATH: /data/ledger.db
+      SEED_DEMO_TREE: "true"
+      ALLOW_RESET: "true"
+      PORT: "8000"
+    volumes:
+      - meter_ledger:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  meter_ledger:
