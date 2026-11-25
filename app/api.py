@@ -11,9 +11,30 @@ from . import service
 from .config import ALLOW_RESET, DB_PATH, SEED_DEMO_TREE
 from .db import reset_database_file
 from .errors import ValidationProblem
-from .payload import HOUR_KEYS, extract_reading_fields
+from .payload import HOUR_KEYS, METER_ID_KEYS, extract_reading_fields, first_present, meter_id_from
 
 router = APIRouter()
+
+_REVIEW_VERSION_KEYS = (
+    "reading_version", "readingVersion", "observed_version", "observedVersion",
+    "seen_version", "seenVersion", "version", "reading_version_no", "v",
+)
+_REVIEW_REVISION_KEYS = (
+    "reading_revision", "readingRevision", "observed_revision", "observedRevision",
+    "seen_revision", "seenRevision", "revision", "incarnation",
+)
+_REVIEW_DECISION_KEYS = (
+    "decision", "conclusion", "verdict", "result", "status", "review",
+    "quality", "outcome", "review_decision",
+)
+_REVIEW_REASON_KEYS = (
+    "reason", "reason_text", "note", "comment", "remark", "remarks",
+    "explanation", "cause", "detail", "details",
+)
+_REVIEWER_KEYS = (
+    "reviewer", "reviewer_id", "reviewerId", "auditor", "operator",
+    "user", "user_id", "userId", "by",
+)
 
 
 def _enriched_bundle(hour: Any) -> dict[str, Any]:
@@ -168,6 +189,7 @@ def index() -> dict[str, Any]:
             "report": ["POST /readings", "POST /readings/report"],
             "correct": ["PUT /readings", "POST /readings/correct"],
             "withdraw": ["DELETE /readings", "POST /readings/withdraw"],
+            "review": ["POST /readings/reviews", "GET /readings/reviews?hour=..."],
             "conclusions": ["GET /reconciliations?hour=...", "GET /reconcile?hour=..."],
         },
     }
@@ -292,6 +314,104 @@ def reading_events(request: Request) -> list[dict[str, Any]]:
     hour = _hour_from_query(request)
     meter_id = params.get("meter_id") or params.get("meterId")
     return service.list_reading_events(hour, meter_id)
+
+
+# -------------------------- Reading quality review --------------------------
+
+def _review_fields(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    merged = _merged_input(request, body)
+    for envelope_key in ("review", "quality_review", "data", "payload"):
+        nested = body.get(envelope_key) if isinstance(body, dict) else None
+        if isinstance(nested, dict):
+            for key, value in nested.items():
+                merged.setdefault(key, value)
+
+    meter_raw = first_present(merged, METER_ID_KEYS)
+    if isinstance(meter_raw, dict):
+        meter_raw = first_present(meter_raw, METER_ID_KEYS)
+    meter_id = meter_id_from(meter_raw)
+
+    return {
+        "meter_id": meter_id,
+        "hour_value": _hour_from_mapping(merged),
+        "observed_version": first_present(merged, _REVIEW_VERSION_KEYS),
+        "observed_revision": first_present(merged, _REVIEW_REVISION_KEYS),
+        "decision_value": first_present(merged, _REVIEW_DECISION_KEYS),
+        "reason_value": first_present(merged, _REVIEW_REASON_KEYS),
+        "reviewer": first_present(merged, _REVIEWER_KEYS),
+    }
+
+
+@router.post("/readings/reviews")
+@router.post("/reading-reviews")
+@router.post("/reading_reviews")
+@router.post("/reviews")
+@router.post("/readings/review")
+@router.post("/quality-reviews")
+@router.post("/quality/reviews")
+async def submit_review(request: Request) -> dict[str, Any]:
+    body = await _json_body(request)
+    fields = _review_fields(request, body)
+    return await run_in_threadpool(service.submit_reading_review, **fields)
+
+
+@router.post("/readings/{meter_id}/reviews")
+@router.post("/readings/{meter_id}/review")
+@router.post("/meters/{meter_id}/reviews")
+async def submit_review_for_meter(meter_id: str, request: Request) -> dict[str, Any]:
+    body = await _json_body(request)
+    fields = _review_fields(request, body)
+    fields["meter_id"] = meter_id
+    return await run_in_threadpool(service.submit_reading_review, **fields)
+
+
+@router.post("/readings/{meter_id}/{hour}/reviews")
+@router.post("/readings/{meter_id}/{hour}/review")
+async def submit_review_path(meter_id: str, hour: str, request: Request) -> dict[str, Any]:
+    body = await _json_body(request)
+    fields = _review_fields(request, body)
+    fields["meter_id"] = meter_id
+    fields["hour_value"] = hour
+    return await run_in_threadpool(service.submit_reading_review, **fields)
+
+
+@router.get("/readings/reviews")
+@router.get("/reading-reviews")
+@router.get("/reading_reviews")
+@router.get("/reviews")
+def list_reviews(request: Request) -> list[dict[str, Any]]:
+    hour = _hour_from_query(request)
+    status_filter = (
+        request.query_params.get("status")
+        or request.query_params.get("decision")
+        or request.query_params.get("review_status")
+    )
+    return service.list_reading_reviews(hour, status_filter)
+
+
+@router.get("/readings/review-events")
+@router.get("/reading-review-events")
+@router.get("/reviews/events")
+def review_events(request: Request) -> list[dict[str, Any]]:
+    params = request.query_params
+    hour = _hour_from_query(request)
+    meter_id = params.get("meter_id") or params.get("meterId")
+    return service.list_reading_review_events(hour, meter_id)
+
+
+@router.get("/readings/{meter_id}/reviews")
+@router.get("/readings/{meter_id}/review")
+@router.get("/meters/{meter_id}/review")
+@router.get("/reviews/{meter_id}")
+def get_review(meter_id: str, request: Request) -> dict[str, Any]:
+    hour = _hour_from_query(request)
+    return service.get_reading_review(meter_id, hour)
+
+
+@router.get("/readings/{meter_id}/reviews/{hour}")
+@router.get("/reviews/{meter_id}/{hour}")
+def get_review_path(meter_id: str, hour: str) -> dict[str, Any]:
+    return service.get_reading_review(meter_id, hour)
 
 
 # Path-parameter variants. A normal path segment is enough for ISO hours;

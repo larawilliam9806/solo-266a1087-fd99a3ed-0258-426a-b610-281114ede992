@@ -139,8 +139,29 @@ def test_correction_and_withdrawal_recompute_chain(client: TestClient):
     row = client.get("/reconciliations/P", params={"hour": HOUR}).json()
     assert row["difference"] == 100
 
+    # A correction resets the reading to pending re-review: until approved it
+    # is held out of the account and behaves like a missing report.
     r = client.put("/readings", json={"meter_id": "A1", "hour": HOUR, "amount": 150})
     assert r.status_code == 200
+    assert r.json()["review"]["status"] == "pending"
+    row = client.get("/reconciliations/P", params={"hour": HOUR}).json()
+    assert row["complete"] is False
+    assert row["missing_meter_ids"] == ["A1"]
+
+    review = client.get("/readings/A1/review", params={"hour": HOUR}).json()
+    approve = client.post(
+        "/readings/reviews",
+        json={
+            "meter_id": "A1",
+            "hour": HOUR,
+            "reading_version": review["reading_version"],
+            "reading_revision": review["reading_revision"],
+            "decision": "approved",
+            "reason": "value verified against feeder meter",
+            "reviewer": "qa-1",
+        },
+    )
+    assert approve.status_code == 200, approve.text
     row = client.get("/reconciliations/P", params={"hour": HOUR}).json()
     assert row["difference"] == 50
     assert row["used_readings"][0]["amount"] == 150
@@ -229,17 +250,31 @@ def test_concurrent_mutations_are_serializable(client: TestClient):
     assert p["sum_used"] == 2000
     assert p["difference"] == 0
 
-    # Concurrent corrections all succeed as upserts; ledger/conclusion agree.
+    # Concurrent corrections all succeed as upserts; each one resets the
+    # reading to pending, so approve the final incarnation afterwards.
     from app.service import apply_reading
 
     apply_reading(action="upsert", meter_id="L0", hour_value=HOUR, amount=100)
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(lambda i: apply_reading(action="upsert", meter_id="L0", hour_value=HOUR, amount=i), range(100, 108)))
 
+    review = client.get("/readings/L0/review", params={"hour": HOUR}).json()
+    approved = client.post(
+        "/readings/reviews",
+        json={
+            "meter_id": "L0",
+            "hour": HOUR,
+            "reading_version": review["reading_version"],
+            "reading_revision": review["reading_revision"],
+            "decision": "approved",
+            "reason": "final value confirmed",
+        },
+    )
+    assert approved.status_code == 200, approved.text
+
     row = client.get("/reconciliations/P", params={"hour": HOUR}).json()
     current = client.get("/meters/L0", params={"hour": HOUR}).json()
     assert current["conclusion"] is None  # leaf has no conclusion
-    assert row["used_readings"][0]["amount"] if row["used_meter_ids"][0] == "L0" else True
     l0_amount = next(item["amount"] for item in row["used_readings"] if item["meter_id"] == "L0")
     assert 100 <= l0_amount <= 107
     assert row["difference"] == 2000 - (1900 + l0_amount)

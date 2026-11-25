@@ -21,10 +21,31 @@ def load_tree(conn: sqlite3.Connection) -> tuple[dict[str, list[str]], dict[str,
 
 
 def load_readings(conn: sqlite3.Connection, hour: str) -> dict[str, int]:
+    """Amounts allowed into the park account for this hour.
+
+    Readings whose quality review is ``pending`` are excluded: reviewers hold
+    them out of the ledger, so tiered reconciliation treats them exactly like
+    missing reports until a later approval re-admits them.
+    """
     rows = conn.execute(
-        "SELECT meter_id, amount FROM readings WHERE hour = ?", (hour,)
+        """
+        SELECT r.meter_id AS meter_id, r.amount AS amount
+        FROM readings r
+        JOIN reading_reviews v
+          ON v.meter_id = r.meter_id AND v.hour = r.hour
+        WHERE r.hour = ? AND v.status != 'pending'
+        """,
+        (hour,),
     ).fetchall()
     return {row["meter_id"]: int(row["amount"]) for row in rows}
+
+
+def load_review_statuses(conn: sqlite3.Connection, hour: str) -> dict[str, str]:
+    rows = conn.execute(
+        "SELECT meter_id, status FROM reading_reviews WHERE hour = ?",
+        (hour,),
+    ).fetchall()
+    return {row["meter_id"]: row["status"] for row in rows}
 
 
 def frontier(
@@ -65,18 +86,27 @@ def recompute_one(
     *,
     children: dict[str, list[str]] | None = None,
     readings: dict[str, int] | None = None,
+    statuses: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     """Recompute and atomically upsert/delete one stored conclusion.
 
-    Returns None when the meter is not eligible (no current own report or no
-    children). Any stale conclusion for an ineligible meter is removed.
+    Returns None when the meter is not eligible (no current *admitted* own
+    report or no children). Any stale conclusion for an ineligible meter is
+    removed. A reading under ``pending`` quality review is not admitted, so the
+    meter loses eligibility and its value is treated as missing downstream.
     """
     meter = conn.execute("SELECT meter_id FROM meters WHERE meter_id = ?", (meter_id,)).fetchone()
     if meter is None:
         return None
 
     own = conn.execute(
-        "SELECT amount FROM readings WHERE meter_id = ? AND hour = ?",
+        """
+        SELECT r.amount AS amount
+        FROM readings r
+        JOIN reading_reviews v
+          ON v.meter_id = r.meter_id AND v.hour = r.hour
+        WHERE r.meter_id = ? AND r.hour = ? AND v.status != 'pending'
+        """,
         (meter_id, hour),
     ).fetchone()
 
@@ -84,6 +114,8 @@ def recompute_one(
         children, _ = load_tree(conn)
     if readings is None:
         readings = load_readings(conn, hour)
+    if statuses is None:
+        statuses = load_review_statuses(conn, hour)
 
     if own is None or not children.get(meter_id):
         conn.execute(
@@ -110,12 +142,21 @@ def recompute_one(
     own_amount = int(own["amount"])
     difference = own_amount - sum_used if is_complete else None
 
+    # Suspended readings inside this meter's subtree are the reviewer-held
+    # equivalents of missing reports; expose them separately for the audit UI.
+    suspended_ids = sorted(
+        mid
+        for mid, status in statuses.items()
+        if status == "pending" and mid != meter_id and _is_in_subtree(mid, meter_id, children)
+    )
+
     conn.execute(
         """
         INSERT INTO reconciliations (
             hour, meter_id, own_amount, is_complete, difference, sum_used,
-            used_meter_ids, used_readings_json, missing_meter_ids
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            used_meter_ids, used_readings_json, missing_meter_ids,
+            suspended_meter_ids_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(hour, meter_id) DO UPDATE SET
             own_amount = excluded.own_amount,
             is_complete = excluded.is_complete,
@@ -124,6 +165,7 @@ def recompute_one(
             used_meter_ids = excluded.used_meter_ids,
             used_readings_json = excluded.used_readings_json,
             missing_meter_ids = excluded.missing_meter_ids,
+            suspended_meter_ids_json = excluded.suspended_meter_ids_json,
             computed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
             version = reconciliations.version + 1
         """,
@@ -137,6 +179,7 @@ def recompute_one(
             json.dumps(used_ids, ensure_ascii=False),
             json.dumps(used_readings, ensure_ascii=False),
             json.dumps(missing_ids, ensure_ascii=False),
+            json.dumps(suspended_ids, ensure_ascii=False),
         ),
     )
     row = conn.execute(
@@ -146,11 +189,27 @@ def recompute_one(
     return serialize_conclusion(row)
 
 
+def _is_in_subtree(node_id: str, root_id: str, children: dict[str, list[str]]) -> bool:
+    """True when *node_id* is a strict descendant of *root_id* in the tree."""
+    stack = list(children.get(root_id, []))
+    seen: set[str] = set()
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        if current == node_id:
+            return True
+        stack.extend(children.get(current, []))
+    return False
+
+
 def serialize_conclusion(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     data = dict(row)
     used_ids = json.loads(data.pop("used_meter_ids", "[]"))
     used_readings = json.loads(data.pop("used_readings_json", "[]"))
     missing_ids = json.loads(data.pop("missing_meter_ids", "[]"))
+    suspended_ids = json.loads(data.pop("suspended_meter_ids_json", "[]") or "[]")
     is_complete = bool(data.pop("is_complete"))
     difference = data.get("difference")
     own_amount = int(data["own_amount"])
@@ -211,6 +270,10 @@ def serialize_conclusion(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         "missing_ids": missing_ids,
         "unreported_meter_ids": missing_ids,
         "pending_meter_ids": missing_ids,
+        "suspended_meter_ids": suspended_ids,
+        "suspendedMeterIds": suspended_ids,
+        "held_meter_ids": suspended_ids,
+        "review_pending_meter_ids": suspended_ids,
         "difference": difference,
         "diff": difference,
         "delta": difference,
